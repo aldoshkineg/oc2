@@ -14,9 +14,12 @@ Usage:
   ./oc --mount SRC[:DST][:OPTS] ...                 → arbitrary extra mounts
   ./oc --drop                                       → drop the project state:
                                                      remove the persistent
-                                                     container (if any) and
+                                                     containers and
                                                      ~/.local/share/oc2/
                                                      profiles/<state>
+  ./oc --drop-container                             → same, but keep the
+                                                     state (opencode login,
+                                                     sessions)
   ./oc --help                                       → this help
 
 Own flags are recognized only BEFORE the first opencode argument; after it
@@ -35,11 +38,15 @@ OC_PROFILES=/path). Section = project:
                wins),
   mounts     — include other sections (recursively, cycles are caught),
   mount      — paths; missing on disk → warning.
-  persistent — true: a named container keeps the container layer between
-               runs (binaries, pip/apt packages, tool settings survive);
-               opencode is entered via podman exec, the container stays
-               around once created (dop it: ./oc --drop); the mounts and
-               the image are baked at creation.
+  persistent — true: the state profile becomes persistent: a named
+               container keeps the layer between runs (binaries, pip/apt
+               packages, tool settings survive); opencode is entered via
+               podman exec, the container stays once created (drop it:
+               ./oc --drop). The container is per project —
+               oc2-<state>-<project>; mounts and the image are baked at
+               creation; /workspace is the project's paths[0]. Any project
+               bound to the same state marks it persistent — the mode
+               applies to every run into that state.
 `--project` enables both the state and the mounts manually; `--state`
 overrides the state.
 
@@ -51,6 +58,7 @@ Environment variables:
   OC_PROFILES=/path   a different profiles.toml (for tests)
 """
 
+import json
 import os
 import re
 import shlex
@@ -129,9 +137,14 @@ def parse_entry(spec, context):
     return Bind(str(src), dst, opts)
 
 
-def container_name(state_name):
-    """Named container for the state profile (persistent projects)."""
-    return f"{CONTAINER_PREFIX}-{state_name}"
+def container_name(state_name, project):
+    """Named container: oc2-<state>-<project> (persistent projects)."""
+    return f"{CONTAINER_PREFIX}-{state_name}-{project}"
+
+
+def container_prefix(state_name):
+    """Prefix matching every project container of the state profile."""
+    return f"{CONTAINER_PREFIX}-{state_name}-"
 
 
 def state_dir(state_name, migrate=True):
@@ -304,7 +317,7 @@ def collect_binds(project_arg, mounts, cwd):
 
 
 def scan_args(argv):
-    """(project, mount specs, state, drop, list_projects, tail).
+    """(project, mount specs, state, drop, drop_container, list_projects, tail).
 
     Own flags are scanned while the tokens match ours; the first foreign token
     starts the "tail", which goes to opencode as a whole.
@@ -313,6 +326,7 @@ def scan_args(argv):
     mounts = []
     state = None
     drop = False
+    drop_container = False
     list_projects = False
     child = []
     i = 0
@@ -356,13 +370,15 @@ def scan_args(argv):
                 mounts.append(tok[len("--mount=") :])
         elif tok == "--drop":
             drop = True
+        elif tok == "--drop-container":
+            drop_container = True
         elif tok == "--project-list":
             list_projects = True
         else:
             child = argv[i:]
             break
         i += 1
-    return project, mounts, state, drop, list_projects, child
+    return project, mounts, state, drop, drop_container, list_projects, child
 
 
 def version_key(tag):
@@ -439,35 +455,54 @@ def run_podman(cmd, what):
 
 
 def container_binds(name):
-    """Binds baked in a persistent container (compare to the requested ones)."""
+    """Binds baked in a persistent container, normalized to "src:dst"."""
     r = run_podman(
-        [
-            "podman",
-            "inspect",
-            "-f",
-            "{{range .HostConfig.Binds}}{{.}}\\x00{{end}}",
-            name,
-        ],
+        ["podman", "inspect", "-f", "{{json .HostConfig.Binds}}", name],
         f"podman inspect {name}",
     )
-    return set(r.stdout.split("\x00"))
+    try:
+        raw = json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        die(f"cannot parse podman inspect output for {name}: {e}")
+    out = set()
+    for b in raw:
+        parts = str(b).split(":")
+        if len(parts) >= 2:
+            out.add(f"{parts[0]}:{parts[1]}")
+    return out
 
 
-def drop_state(state, data):
-    """Remove the persistent container (if any) and the state directory."""
-    name = container_name(state)
+def drop_state(state, data, wipe_state=True):
+    """Remove the state containers (oc2-<state>-*) and the state directory."""
+    prefix = container_prefix(state)
+    glob = f"{prefix}*"
     if os.environ.get("OC_DRY_RUN") == "1":
-        print(shlex.join(["podman", "rm", "-f", name]))
-        print(shlex.join(["rm", "-rf", str(data)]))
+        print(shlex.join(["podman", "rm", "-f", glob]))
+        if wipe_state:
+            print(shlex.join(["rm", "-rf", str(data)]))
         return
-    if podman_present(
-        ["podman", "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"],
-        name,
-    ):
-        run_podman(["podman", "rm", "-f", name], f"podman rm {name}")
-        print(f"oc: >> removed the persistent container {name}")
+    r = subprocess.run(
+        [
+            "podman",
+            "ps",
+            "-a",
+            "--filter",
+            f"name=^{prefix}",
+            "--format",
+            "{{.Names}}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        die("podman ps failed: " + (r.stderr or "").strip())
+    names = sorted(n for n in r.stdout.split() if n.startswith(prefix))
+    if names:
+        for n in names:
+            run_podman(["podman", "rm", "-f", n], f"podman rm {n}")
+        print(f"oc: >> removed the persistent containers: {', '.join(names)}")
     else:
-        print(f"oc: >> no persistent container {name}")
+        print(f"oc: >> no persistent containers {glob}")
     if Path(data).exists():
         # guard: never wipe a suspicious or root-ish path
         if (
@@ -478,14 +513,19 @@ def drop_state(state, data):
             die(f"refusing to wipe a suspicious path: {data}")
         if not Path(data).is_dir():
             die(f"refusing to wipe: not a directory: {data}")
-        shutil.rmtree(data)
-        print(f"oc: >> dropped the state: {data}")
+        if wipe_state:
+            shutil.rmtree(data)
+            print(f"oc: >> dropped the state: {data}")
+        else:
+            print(f"oc: >> state kept: {data}")
     else:
         print(f"oc: >> state already gone: {data}")
 
 
 def main():
-    project_arg, mounts, state_arg, drop, list_projects, child = scan_args(sys.argv[1:])
+    project_arg, mounts, state_arg, drop, drop_container, list_projects, child = (
+        scan_args(sys.argv[1:])
+    )
     cwd = Path(os.environ.get("OC_WORKSPACE") or os.getcwd()).resolve()
     binds, warns, state_hint, chosen = collect_binds(project_arg, mounts, cwd)
 
@@ -494,14 +534,14 @@ def main():
 
     state = state_arg or state_hint or STATE_NAME_DEFAULT
 
-    if drop:
+    if drop or drop_container:
         if not chosen and not state_arg:
             die(
                 "--drop: resolve a target first: run from a project directory, "
                 "or pass --project <name> / --state <name>"
             )
         data = state_dir(state, migrate=False)
-        drop_state(state, data)
+        drop_state(state, data, wipe_state=not drop_container)
         return
 
     data = state_dir(state, migrate=not list_projects)
@@ -540,12 +580,32 @@ def main():
     image = pick_image(os.environ.get("OC_IMAGE", ""))
     os.makedirs(data, exist_ok=True)
 
+    profiles, _ = load_profiles()
+    owners = [
+        name
+        for name, body in profiles.items()
+        if body.get("persistent") is True
+        and str(body.get("state") or STATE_NAME_DEFAULT) == state
+    ]
+    # Persistence is a property of the state profile: any project bound to it
+    # with persistent = true makes every run into that state persistent.
+    # The container identity is per project.
+    persistent = bool(owners)
+    owner = chosen if chosen in owners else None
+    if owner is None and len(owners) == 1:
+        owner = owners[0]
+    if persistent and owner is None:
+        die(
+            f"state '{state}' is persistent with several projects: "
+            f"{', '.join(sorted(owners))} — pick one: --project <name>"
+        )
+    if owner:
+        # re-entering the project container: /workspace is the project's
+        # canonical directory (paths[0]), not the launch cwd
+        ppaths = profiles.get(owner, {}).get("paths") or []
+        if ppaths:
+            workspace = Path(str(ppaths[0])).expanduser()
     mount_and_env = mount_args(data, workspace, binds) + env_args()
-
-    persistent = False
-    if chosen:
-        profiles, _ = load_profiles()
-        persistent = bool(profiles.get(chosen, {}).get("persistent"))
 
     if not persistent:
         run_args = ["podman", "run", "--rm"]
@@ -559,7 +619,7 @@ def main():
 
     # persistent project: a named container keeps the layer between runs;
     # opencode is entered via podman exec (the entrypoint just sleeps).
-    name = container_name(state)
+    name = container_name(state, owner)
     create_args = [
         "podman",
         "create",
@@ -587,16 +647,17 @@ def main():
         name,
     ):
         run_podman(["podman", "start", name], f"podman start {name}")
+    print(f"oc: >> entering the persistent container {name}", file=sys.stderr)
     # the mounts are baked into the container at creation; make sure the
     # profile did not change them since
     baked = container_binds(name)
-    wanted = {f"{data}:/data", f"{workspace}:/workspace", *(b.vol() for b in binds)}
-    stale = {x for x in wanted if x not in baked and not x.endswith(":/workspace")}
+    wanted = {f"{data}:/data", *(f"{b.src}:{b.dst}" for b in binds)}
+    stale = wanted - baked
     if stale:
         die(
             f"the persistent container {name} has different mounts "
             f"(baked at creation): {', '.join(sorted(stale))}; "
-            f"recreate it: ./oc --drop [--project {chosen}]"
+            f"recreate it: ./oc --drop --project {owner}"
         )
     os.execvp("podman", exec_args)
 

@@ -35,7 +35,7 @@ DAYNEWS_TOML = textwrap.dedent("""
 # A persistent project: the named container keeps the layer between runs
 PERSISTENT_TOML = textwrap.dedent("""
     [daynews]
-    state = "oc2"
+    state = "oc"
     persistent = true
     paths = ["{home}/src/daynews"]
     mount = [
@@ -186,7 +186,7 @@ class PickImage(Base):
 
 class ScanArgs(Base):
     def test_flags_and_tail(self):
-        p, m, st, _, lp, child = oc.scan_args(
+        p, m, st, _, _, lp, child = oc.scan_args(
             [
                 "--project",
                 "d",
@@ -211,11 +211,11 @@ class ScanArgs(Base):
         )
 
     def test_dash_dash(self):
-        _, _, _, _, _, child = oc.scan_args(["--project", "d", "--", "--list"])
+        _, _, _, _, _, _, child = oc.scan_args(["--project", "d", "--", "--list"])
         self.assertEqual(child, ["--list"])
 
     def test_drop_flag(self):
-        project, _, _, drop, list_projects, _ = oc.scan_args(["--drop"])
+        project, _, _, drop, _, list_projects, _ = oc.scan_args(["--drop"])
         self.assertTrue(drop)
         self.assertFalse(list_projects)
 
@@ -225,7 +225,7 @@ class ScanArgs(Base):
         self.assertIn("oc:", str(cm.exception))
 
     def test_project_equality_form(self):
-        p, _, _, _, _, _ = oc.scan_args(["--project=hello"])
+        p, _, _, _, _, _, _ = oc.scan_args(["--project=hello"])
         self.assertEqual(p, "hello")
 
 
@@ -321,6 +321,21 @@ class CollectBinds(Base):
         with self.assertRaises(SystemExit) as cm:
             oc.collect_binds("d", [], self.tmp)
         self.assertIn("persistent must be true/false", str(cm.exception))
+
+    def test_persistent_several_projects_ambiguous(self):
+        # two persistent projects on the same state, no project resolved
+        # — ambiguous owner, refuse
+        self.set_profiles(
+            PERSISTENT_TOML
+            + textwrap.dedent("""
+            [other]
+            state = "oc"
+            persistent = true
+        """)
+        )
+        r = self.oc_run(["run", "hi"], cwd=self.tmp)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("several projects", r.stderr)
 
     def test_missing_paths_warn(self):
         self.daynews_fixture()
@@ -465,18 +480,38 @@ class E2E(Base):
         self.set_profiles(PERSISTENT_TOML)
         r = self.oc_run(["run", "-m", "x/y", "hi"], cwd=proj)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("podman create --name oc2-oc2", r.stdout)
+        self.assertIn("podman create --name oc2-oc-daynews", r.stdout)
         self.assertIn('["sleep","infinity"]', r.stdout)
-        self.assertIn("podman start oc2-oc2", r.stdout)
-        self.assertIn("podman exec oc2-oc2 run -m x/y hi", r.stdout)
+        self.assertIn("podman start oc2-oc-daynews", r.stdout)
+        self.assertIn("podman exec oc2-oc-daynews run -m x/y hi", r.stdout)
+
+    def test_dry_run_persistent_state_level(self):
+        # persistence is a property of the state: even with no project
+        # resolved from cwd the run reuses the named container
+        self.daynews_fixture()
+        self.set_profiles(PERSISTENT_TOML)
+        r = self.oc_run(["run", "-m", "x/y", "hi"], cwd=self.tmp)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("podman create --name oc2-oc-daynews", r.stdout)
 
     def test_dry_run_drop(self):
         proj = self.daynews_fixture()
         self.set_profiles(DAYNEWS_TOML)
         r = self.oc_run(["--drop"], cwd=proj)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("podman rm -f oc2-oc2", r.stdout)
+        self.assertIn("podman rm -f", r.stdout)
+        self.assertIn("oc2-oc2-*", r.stdout)
         self.assertIn(str(self.home / ".local/share/oc2/profiles/oc2"), r.stdout)
+
+    def test_dry_run_drop_container_keeps_state(self):
+        proj = self.daynews_fixture()
+        self.set_profiles(DAYNEWS_TOML)
+        r = self.oc_run(["--drop-container"], cwd=proj)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("podman rm -f", r.stdout)
+        self.assertIn("oc2-oc2-*", r.stdout)
+        # no rm -rf of the state directory in the plan
+        self.assertNotIn("rm -rf", r.stdout)
 
     def test_drop_requires_target(self):
         self.set_profiles(DAYNEWS_TOML)

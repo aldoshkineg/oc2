@@ -102,6 +102,13 @@ container mounts. All decisions are agreed:
       opencode); dry-run quotes the arguments via shlex.join; the dead USAGE_EXIT
       removed; `--project` is validated before auto-detection; docstring updates
       (`load_profiles`, flags, env). Tests: 31 (+help/hint/quoting).
+- [x] persistent state profiles + `--drop`/`--drop-container`: a project with
+      `persistent = true` gets a named container `oc2-<state>-<project>` (sleep
+      entrypoint, opencode via podman exec): binaries/packages installed in a
+      session survive restarts; mounts + image are baked at creation (drift →
+      refused with a hint); `/workspace` = the project's paths[0]. Persistence
+      belongs to the state: any project bound to it marks it persistent for
+      every run into that state.
 - [ ] (optional) `make shell` should also pass the day-profiles — currently
       shell mounts only /data and /workspace directly via podman
 - [ ] (optional) a "pre-ingest" mode: a separate profile/flag so that the

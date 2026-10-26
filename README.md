@@ -82,11 +82,12 @@ with a printed warning.
 
 `profiles.toml` (section = project; `state` — state profile, `paths` — where
 the project lives for auto-detection, `mount` — paths, `mounts` — include
-paths of other sections):
+paths of other sections, `persistent` — keep the container between runs):
 
 ```toml
 [daynews]
 state = "oc2"                    # state → ~/.local/share/oc2/profiles/oc2
+persistent = true                # named container, survives restarts
 paths = [                        # ./oc from this dir (or deeper)
   "~/src/daynews",              # activates the project automatically
 ]
@@ -118,6 +119,34 @@ Extra mounts are rw: SQLite WAL databases don't work without write access to
 
 Don't open the same SQLite database from the container and the host at the
 same time.
+
+## Persistent projects
+
+A project with `persistent = true` gets a named container
+`oc2-<state>-<project>` (entrypoint sleeps, opencode is entered via
+`podman exec`). Repeated exits do not destroy the container: binaries, pip/apt
+packages and tool settings installed in a session survive restarts (the
+`/data` state survives anyway — login, sessions, DB).
+
+Everything about the container is baked at creation: the image, the profile
+mounts, `/data`, and `/workspace` = `paths[0]` of the project (the cwd at
+launch does not matter). Changing mounts in the profile later is detected and
+refused with a hint to recreate the container.
+
+```sh
+./oc                                             # enters the container (or
+                                                 # creates it on first run)
+./oc --project daynews                           # same, resolved manually
+./oc --drop-container                            # remove the container(s)
+                                                 # oc2-<state>-*, keep the
+                                                 # state (login, sessions)
+./oc --drop                                      # remove containers + the
+                                                 # state profile altogether
+```
+
+Both drop flags resolve the target the same way (cwd project, `--project`,
+`--state`) and refuse to run without one. `OC_DRY_RUN=1` prints the whole
+chain (`create → start → exec` or the removal commands) without running them.
 
 ## Layout inside the state profile (~/.local/share/oc2/profiles/<state>/)
 

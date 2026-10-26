@@ -10,6 +10,11 @@
 #            (state→/data/state, share→/data/data, config→/data/cfg,
 #            cache→/data/cache, anything else→/mnt);
 #            "SRC:DST[:OPTS]" — mounted explicitly (e.g. ro)
+#   persistent: true makes the state profile persistent: a named container
+#             (oc2-<state>-<project>) is kept between runs — binaries and
+#             tool settings installed in a session survive restarts; drop
+#             it with `./oc --drop` (or `--drop-container` to keep the
+#             state)
 # Paths missing on disk → a warning, the run continues.
 
 [myproject]
