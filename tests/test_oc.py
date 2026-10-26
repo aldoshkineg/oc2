@@ -32,6 +32,17 @@ DAYNEWS_TOML = textwrap.dedent("""
     ]
 """)
 
+# A persistent project: the named container keeps the layer between runs
+PERSISTENT_TOML = textwrap.dedent("""
+    [daynews]
+    state = "oc2"
+    persistent = true
+    paths = ["{home}/src/daynews"]
+    mount = [
+      "{home}/.local/state/daynews",
+    ]
+""")
+
 
 def load_oc():
     loader = importlib.machinery.SourceFileLoader("oc_mod", str(OC))
@@ -175,7 +186,7 @@ class PickImage(Base):
 
 class ScanArgs(Base):
     def test_flags_and_tail(self):
-        p, m, st, lp, child = oc.scan_args(
+        p, m, st, _, lp, child = oc.scan_args(
             [
                 "--project",
                 "d",
@@ -200,8 +211,13 @@ class ScanArgs(Base):
         )
 
     def test_dash_dash(self):
-        _, _, _, _, child = oc.scan_args(["--project", "d", "--", "--list"])
+        _, _, _, _, _, child = oc.scan_args(["--project", "d", "--", "--list"])
         self.assertEqual(child, ["--list"])
+
+    def test_drop_flag(self):
+        project, _, _, drop, list_projects, _ = oc.scan_args(["--drop"])
+        self.assertTrue(drop)
+        self.assertFalse(list_projects)
 
     def test_bad_state(self):
         with self.assertRaises(SystemExit) as cm:
@@ -209,7 +225,7 @@ class ScanArgs(Base):
         self.assertIn("oc:", str(cm.exception))
 
     def test_project_equality_form(self):
-        p, _, _, _, _ = oc.scan_args(["--project=hello"])
+        p, _, _, _, _, _ = oc.scan_args(["--project=hello"])
         self.assertEqual(p, "hello")
 
 
@@ -299,6 +315,12 @@ class CollectBinds(Base):
         with self.assertRaises(SystemExit) as cm:
             oc.collect_binds("other", [], self.tmp)
         self.assertIn("conflicting state", str(cm.exception))
+
+    def test_persistent_must_be_bool(self):
+        self.set_profiles('[d]\npersistent = "yes"\n')
+        with self.assertRaises(SystemExit) as cm:
+            oc.collect_binds("d", [], self.tmp)
+        self.assertIn("persistent must be true/false", str(cm.exception))
 
     def test_missing_paths_warn(self):
         self.daynews_fixture()
@@ -437,6 +459,30 @@ class E2E(Base):
         self.set_profiles("[x]\n")
         r = self.oc_run(["run", "-m", "x/y", "question with spaces"])
         self.assertIn("'question with spaces'", r.stdout)
+
+    def test_dry_run_persistent_container(self):
+        proj = self.daynews_fixture()
+        self.set_profiles(PERSISTENT_TOML)
+        r = self.oc_run(["run", "-m", "x/y", "hi"], cwd=proj)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("podman create --name oc2-oc2", r.stdout)
+        self.assertIn('["sleep","infinity"]', r.stdout)
+        self.assertIn("podman start oc2-oc2", r.stdout)
+        self.assertIn("podman exec oc2-oc2 run -m x/y hi", r.stdout)
+
+    def test_dry_run_drop(self):
+        proj = self.daynews_fixture()
+        self.set_profiles(DAYNEWS_TOML)
+        r = self.oc_run(["--drop"], cwd=proj)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("podman rm -f oc2-oc2", r.stdout)
+        self.assertIn(str(self.home / ".local/share/oc2/profiles/oc2"), r.stdout)
+
+    def test_drop_requires_target(self):
+        self.set_profiles(DAYNEWS_TOML)
+        r = self.oc_run(["--drop"], cwd=self.tmp)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("--drop: resolve a target", r.stderr)
 
     @unittest.skipIf(shutil.which("podman"), "podman present — test is moot")
     def test_no_podman_no_image(self):
