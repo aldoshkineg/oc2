@@ -17,7 +17,7 @@ jobs:
 
       - uses: astral-sh/setup-uv@v10.3.2
         with:
-          # минимум, который гарантирует ./oc (tomllib)
+          # the minimum ./oc requires (tomllib)
           python-version: "3.11"
           enable-cache: true
 

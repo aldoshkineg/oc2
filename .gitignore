@@ -5,10 +5,10 @@ __pycache__/
 # venv / uv
 .venv/
 
-# инструменты
+# tools
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 
-# артефакты сборки (живут в /tmp/oc-build, но на всякий случай)
+# build artifacts (they live in /tmp/oc-build, but just in case)
 *.tgz

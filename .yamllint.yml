@@ -5,5 +5,5 @@ rules:
   document-start: disable
   line-length: disable
   truthy:
-    # 'on:' — валидный ключ workflow у GitHub Actions
+    # 'on:' is a valid workflow key in GitHub Actions
     check-keys: false

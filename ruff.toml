@@ -1,12 +1,12 @@
-# Lint ./oc и tests/ (цель: make lint). Настройка актуальна для python ≥ 3.11.
+# Lint ./oc and tests/ (target: make lint). Valid for python >= 3.11.
 target-version = "py311"
 line-length = 88
 
 [lint]
 select = [
   "E",   # pycodestyle errors
-  "W",   # warnings (пробелы/переносы)
-  "F",   # pyflakes: неиспользуемое, неопределённое
-  "I",   # сортировка импортов
-  "UP",  # устаревшие типы/синтаксис
+  "W",   # warnings (whitespace/line breaks)
+  "F",   # pyflakes: unused, undefined names
+  "I",   # import sorting
+  "UP",  # outdated types/syntax
 ]

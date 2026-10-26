@@ -13,7 +13,7 @@ jobs:
   pre-commit:
     runs-on: ubuntu-latest
     steps:
-      # fetch-depth: 0 — нужен gitleaks (сканирует всю историю)
+      # fetch-depth: 0 is needed by gitleaks (it scans the whole history)
       - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
