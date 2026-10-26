@@ -1,0 +1,14 @@
+# python
+__pycache__/
+*.py[cod]
+
+# venv / uv
+.venv/
+
+# инструменты
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# артефакты сборки (живут в /tmp/oc-build, но на всякий случай)
+*.tgz

@@ -1,0 +1,26 @@
+[project]
+name = "oc2"
+version = "0.1.0"
+description = "Utility for isolating opencode runs in a container with per-project settings"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Eugene Aldoshkin" }]
+requires-python = ">=3.11"
+
+# Рантайм — только stdlib (python >= 3.11, tomllib); скрипт ./oc без pip-зависимостей.
+# Все инструменты разработки — dev-группа (PEP 735), ставятся через uv.
+
+[dependency-groups]
+dev = [
+  "pre-commit",
+  "pytest",
+  "ruff",
+]
+
+# Скриптовый проект: без сборки/установки самого пакета, только venv с dev-зависимостями.
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

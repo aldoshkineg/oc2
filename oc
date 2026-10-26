@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""Run opencode CLI v2 in a podman container: ./oc [oc flags] [opencode args]
+
+Usage:
+  ./oc                                              → TUI
+  ./oc run -m opencode/glm-5.3-flash-free "prompt"  → one-shot command
+  ./oc                                              → launched from a project
+                                                     directory (paths from
+                                                     profiles.toml) it activates
+                                                     the project automatically
+  ./oc --project daynews ...                        → project manually
+  ./oc --project-list                               → projects and their effect
+  ./oc --state or2 ...                              → profiles/or2 state
+  ./oc --mount SRC[:DST][:OPTS] ...                 → arbitrary extra mounts
+  ./oc --help                                       → this help
+
+Own flags are recognized only BEFORE the first opencode argument; after it
+everything is passed to opencode as is (./oc run --help is opencode's --help).
+The current directory is mounted as /workspace. State lives in
+~/.local/share/oc2/profiles/<state> as /data (default oc; the old flat
+~/.local/share/oc2/{cfg,data,…} migrates automatically). Extra paths mirror
+the XDG layout (see README, "Workspaces and extra mounts"). Without a TTY the
+-it flag is not added.
+
+Projects — a single profiles.toml: looked up next to ./oc first, then in
+~/.config/oc/profiles.toml (tomllib → python >= 3.11; for tests:
+OC_PROFILES=/path). Section = project:
+  state  — state profile name (~/.local/share/oc2/profiles/<state>),
+  paths  — project directories for cwd auto-detection (deepest match wins),
+  mounts — include other sections (recursively, cycles are caught),
+  mount  — paths; missing on disk → warning.
+`--project` enables both the state and the mounts manually; `--state`
+overrides the state.
+
+Environment variables:
+  OC_IMAGE=repo:tag   override the image
+  OC_DATA=/path       where the state lives (default ~/.local/share/oc2)
+  OC_WORKSPACE=/path  what to mount as /workspace (default cwd)
+  OC_DRY_RUN=1        print the podman command without running it
+  OC_PROFILES=/path   a different profiles.toml (for tests)
+"""
+
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+
+IMAGE_REPO = "localhost/opencode"
+STATE_ROOT_DEFAULT = "~/.local/share/oc2"
+STATE_NAME_DEFAULT = "oc"
+
+# In-container XDG_* point to /data/* (see Dockerfile), so host XDG paths are
+# mirrored into the matching /data subdirectories.
+XDG_MAP = (
+    (".local/state", "state"),
+    (".local/share", "data"),
+    (".config", "cfg"),
+    (".cache", "cache"),
+)
+
+
+@dataclass
+class Bind:
+    src: str
+    dst: str
+    opts: str = ""
+
+    def vol(self) -> str:
+        return (
+            f"{self.src}:{self.dst}:{self.opts}"
+            if self.opts
+            else f"{self.src}:{self.dst}"
+        )
+
+
+def mirror(src: Path) -> str:
+    """Container path for host src — mirrors the XDG layout."""
+    try:
+        rel = src.expanduser().resolve().relative_to(Path.home().resolve())
+    except ValueError:
+        return f"/mnt/{src.name}"
+    s = rel.as_posix()
+    for prefix, dst in XDG_MAP:
+        if s == prefix:
+            return f"/data/{dst}"
+        if s.startswith(prefix + "/"):
+            return f"/data/{dst}/{s[len(prefix) + 1 :]}"
+    return f"/mnt/{s}"
+
+
+def die(msg):
+    """Error: "oc: …" to stderr + SystemExit with the same message (code 1)."""
+    raise SystemExit(f"oc: {msg}")
+
+
+def parse_entry(spec, context):
+    """spec "SRC[:DST[:OPTS]]" → Bind; DST without a value → the XDG mirror."""
+    parts = spec.split(":")
+    if len(parts) == 3:
+        src_str, dst, opts = parts
+    elif len(parts) == 2:
+        src_str, dst, opts = parts[0], parts[1], ""
+    elif len(parts) == 1:
+        src_str, dst, opts = parts[0], "", ""
+    else:
+        die(f"{context}: cannot parse '{spec}' (expected SRC[:DST[:OPTS]])")
+    if not src_str.strip():
+        die(f"{context}: empty SRC in '{spec}'")
+    src = Path(src_str).expanduser()
+    dst = dst or mirror(src)
+    return Bind(str(src), dst, opts)
+
+
+def state_dir(state_name, migrate=True):
+    """State directory: ~/.local/share/oc2/profiles/<name> (or OC_DATA).
+
+    The old flat ~/.local/share/oc2/{cfg,data,state,cache} moves into
+    profiles/<name> once — without losing the login or the sessions. Once and
+    forever: after the move a root/.migrated marker is placed — whatever shows
+    up on disk later, nothing is moved again. If profiles/<name> already has
+    live state → the flat directories stay untouched (with a warning).
+    """
+    root = Path(os.environ.get("OC_DATA") or STATE_ROOT_DEFAULT).expanduser()
+    if os.environ.get("OC_DATA"):  # path is set manually — no migration needed
+        return root
+    target = root / "profiles" / state_name
+    if not migrate or (root / ".migrated").is_file():
+        return target
+    flat = [d for d in ("cfg", "data", "state", "cache") if (root / d).is_dir()]
+    if not flat:
+        return target
+    listing = f"{{{','.join(flat)}}}"
+    if target.is_dir() and any(target.iterdir()):
+        (root / ".migrated").touch()
+        print(
+            f"oc: >> !!! flat state {root}/{listing} stays in place: "
+            f"{target} is not empty; compare/move it manually "
+            f"and remove the leftovers",
+            file=sys.stderr,
+        )
+        return target
+    target.mkdir(parents=True)
+    for d in flat:
+        (root / d).rename(target / d)
+    (root / ".migrated").touch()
+    print(
+        f"oc: >> moved the old state {root}/{listing} → {target} (one-time)",
+        file=sys.stderr,
+    )
+    return target
+
+
+def profiles_file():
+    """Lookup: OC_PROFILES (tests) → profiles.toml next to ./oc → ~/.config/oc."""
+    if os.environ.get("OC_PROFILES"):
+        return Path(os.environ["OC_PROFILES"])
+    local = Path(__file__).resolve().parent / "profiles.toml"
+    if local.is_file():
+        return local
+    user = Path("~/.config/oc/profiles.toml").expanduser()
+    if user.is_file():
+        return user
+    die(
+        "profiles not found: put profiles.toml next to ./oc "
+        "or into ~/.config/oc/profiles.toml (a template is in the repo: "
+        "profiles.toml.example)"
+    )
+
+
+def load_profiles():
+    """profiles.toml → {project name: {state, paths, mounts, mount}} + path."""
+    path = profiles_file()
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except FileNotFoundError:
+        die(f"cannot read the profiles file: {path}")
+    profiles = {}
+    for name, body in data.items():
+        if not isinstance(body, dict):
+            die(f"{path}: [{name}] must be a table")
+        profiles[name] = body
+    return profiles, path
+
+
+def collect_binds(project_arg, mounts, cwd):
+    """Binds and a state hint from the project + --mount.
+
+    project_arg — a project name from profiles.toml or None: then the project
+    is detected from cwd (paths of the sections; the deepest match wins).
+    Returns (binds, warnings, state_hint | None, project name | None).
+    """
+    profiles, path = load_profiles()
+    binds = []
+    warns = []
+    state_hint = None
+
+    def valid_state(st, src):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", st):
+            die(f"{path}: [{src}]: invalid state '{st}'")
+        return st
+
+    def apply(name, stack=()):
+        nonlocal state_hint
+        if name in stack:
+            die(f"{path}: inclusion cycle: {' → '.join(stack + (name,))}")
+        if name not in profiles:
+            die(
+                f"{path}: no project '{name}' — available: "
+                f"{', '.join(sorted(profiles))}"
+            )
+        body = profiles[name]
+        if "state" in body:
+            st = valid_state(str(body["state"]), name)
+            if state_hint and state_hint != st:
+                die(
+                    f"{path}: conflicting state in the involved projects "
+                    f"({state_hint}, {st})"
+                )
+            state_hint = st
+        for inc in body.get("mounts", []):
+            apply(str(inc), stack + (name,))
+        missing = []
+        for spec in body.get("mount", []):
+            b = parse_entry(spec, f"{path}: [{name}]")
+            if not Path(b.src).exists():
+                missing.append(b.src)
+                continue
+            binds.append(b)
+        if missing:
+            warns.append(f"project {name}: missing {', '.join(missing)} — skipping")
+
+    def detect():
+        """Project from cwd: paths of the sections, the deepest match wins."""
+        cands = []
+        for name, body in profiles.items():
+            for p in body.get("paths", []):
+                base = Path(str(p)).expanduser().resolve()
+                # we are inside the project: cwd is the directory itself
+                # or one of its subdirectories
+                if cwd == base or base in cwd.parents:
+                    cands.append((len(base.parts), name))
+        if not cands:
+            return None
+        cands.sort(reverse=True)
+        best = cands[0][1]
+        if len({n for _, n in cands}) > 1:
+            warns.append(
+                "projects matching cwd: "
+                f"{', '.join(sorted({n for _, n in cands}))} — "
+                f"picking the deepest ({best})"
+            )
+        return best
+
+    if project_arg and project_arg not in profiles:
+        die(
+            f"{path}: no project '{project_arg}' — available: "
+            f"{', '.join(sorted(profiles))}"
+        )
+    chosen = project_arg or detect()
+    if chosen and not project_arg:
+        print(f"oc: >> project {chosen} (cwd)", file=sys.stderr)
+    if chosen:
+        apply(chosen)
+    for spec in mounts:
+        b = parse_entry(spec, "--mount")
+        if not Path(b.src).exists():
+            die(f"--mount: no such path {b.src}")
+        binds.append(b)
+
+    seen = {}
+    for b in binds:
+        dst = b.dst.rstrip("/")
+        if dst in seen and seen[dst] != b.src:
+            die(f"mount collision: {b.src} and {seen[dst]} both → {b.dst}")
+        seen[dst] = b.src
+    return binds, warns, state_hint, chosen
+
+
+def scan_args(argv):
+    """(project, mount specs, state, list_projects, tail for opencode).
+
+    Own flags are scanned while the tokens match ours; the first foreign token
+    starts the "tail", which goes to opencode as a whole.
+    """
+    project = None
+    mounts = []
+    state = None
+    list_projects = False
+    child = []
+    i = 0
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        if tok in ("-h", "--help"):
+            print(__doc__.strip())
+            raise SystemExit(0)
+        if tok == "--":
+            child = argv[i + 1 :]
+            break
+        if tok == "--state" or tok.startswith("--state="):
+            if tok == "--state":
+                i += 1
+                if i >= n:
+                    die("--state: give a name, e.g. --state or2")
+                state = argv[i]
+            else:
+                state = tok[len("--state=") :]
+            if not state or Path(state).name != state or state.startswith("."):
+                die(f"--state: invalid name '{state}' (no '/', '..' or dots)")
+        elif tok == "--project" or tok.startswith("--project="):
+            if tok == "--project":
+                i += 1
+                if i >= n:
+                    die(
+                        "--project: give a project from profiles.toml, "
+                        "e.g. --project daynews"
+                    )
+                project = argv[i]
+            else:
+                project = tok[len("--project=") :]
+        elif tok == "--mount" or tok.startswith("--mount="):
+            if tok == "--mount":
+                i += 1
+                if i >= n:
+                    die("--mount: give a source, e.g. --mount ~/.local/state/daynews")
+                mounts.append(argv[i])
+            else:
+                mounts.append(tok[len("--mount=") :])
+        elif tok == "--project-list":
+            list_projects = True
+        else:
+            child = argv[i:]
+            break
+        i += 1
+    return project, mounts, state, list_projects, child
+
+
+def version_key(tag):
+    """Sort key for tags by the numbers inside ('2.10' > '2.9')."""
+    return [int(p) for p in re.findall(r"\d+", tag)]
+
+
+def pick_image(image_env):
+    """OC_IMAGE wins; otherwise the freshest tag of the IMAGE_REPO image.
+
+    The repo name is mandatory: without it `podman images` returns the tags of
+    ALL images and a foreign :3.22 (alpine etc.) becomes
+    localhost/opencode:3.22.
+    """
+    if image_env:
+        return image_env
+    try:
+        out = subprocess.run(
+            ["podman", "images", "--format", "{{.Tag}}", IMAGE_REPO],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except FileNotFoundError:
+        die("podman not found (and OC_IMAGE is not set)")
+    except subprocess.CalledProcessError as e:
+        die("podman images failed: " + (e.stderr or "").strip())
+    tags = [t for t in out.splitlines() if t and t != "<none>"]
+    if not tags:
+        die(f"no image {IMAGE_REPO} — build one: make build")
+    return f"{IMAGE_REPO}:{max(tags, key=version_key)}"
+
+
+def main():
+    project_arg, mounts, state_arg, list_projects, child = scan_args(sys.argv[1:])
+    cwd = Path(os.environ.get("OC_WORKSPACE") or os.getcwd()).resolve()
+    binds, warns, state_hint, chosen = collect_binds(project_arg, mounts, cwd)
+
+    for w in warns:
+        print(f"oc: >> {w}", file=sys.stderr)
+
+    state = state_arg or state_hint or STATE_NAME_DEFAULT
+    data = state_dir(state, migrate=not list_projects)
+
+    if list_projects:
+        profiles, _ = load_profiles()
+        if profiles:
+            print("profiles.toml projects:")
+            for name in sorted(profiles):
+                body = profiles[name]
+                paths = ", ".join(body.get("paths", [])) or "—"
+                print(
+                    f"  {name}  state={body.get('state', '—')}  "
+                    f"mount={len(body.get('mount', []))}  paths=[{paths}]"
+                )
+        else:
+            print("profiles.toml is empty — no project sections")
+        print("effect for the current directory:")
+        rows = [(str(data), "/data"), (str(cwd), "/workspace")]
+        rows += [
+            (b.src, b.dst + (" [ro]" if "ro" in b.opts.split(",") else ""))
+            for b in binds
+        ]
+        for src, dst in rows:
+            print(f"  {src}  →  {dst}")
+        if not chosen and profiles:
+            print(
+                "hint: no project mounts — cwd matched none of the "
+                "paths; run from a project directory or "
+                f"--project <{next(iter(sorted(profiles)))} | …>"
+            )
+        return
+
+    workspace = Path(os.environ.get("OC_WORKSPACE") or os.getcwd()).expanduser()
+    image = pick_image(os.environ.get("OC_IMAGE", ""))
+    os.makedirs(data, exist_ok=True)
+
+    run_args = ["podman", "run", "--rm"]
+    if sys.stdin.isatty():
+        run_args.append("-it")
+    run_args += ["-v", f"{data}:/data", "-v", f"{workspace}:/workspace"]
+    for b in binds:
+        run_args += ["-v", b.vol()]
+    for v in (
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+        "no_proxy",
+    ):
+        if os.environ.get(v):
+            run_args += ["-e", v]
+    run_args += [image] + child
+
+    if os.environ.get("OC_DRY_RUN") == "1":
+        print(shlex.join(run_args))
+        return
+
+    os.execvp("podman", run_args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

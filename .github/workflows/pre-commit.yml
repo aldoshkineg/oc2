@@ -1,0 +1,27 @@
+name: pre-commit
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 — нужен gitleaks (сканирует всю историю)
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v10.3.2
+        with:
+          enable-cache: true
+
+      - run: uv sync --frozen
+
+      - run: uv run pre-commit run --all-files

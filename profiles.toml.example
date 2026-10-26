@@ -1,0 +1,21 @@
+# Example profiles for ./oc. Copy to one of the lookup locations:
+#   - profiles.toml next to ./oc            (shareable, can be committed), or
+#   - ~/.config/oc/profiles.toml            (personal, not in the repo)
+# A section = a project:
+#   state  = state profile name → ~/.local/share/oc2/profiles/<state> = /data
+#   paths  = where the project lives; ./oc from that directory (or deeper)
+#            activates the project automatically (the deepest match wins)
+#   mounts = include paths of other sections (recursively, cycles are caught)
+#   mount  = own paths: without ":" mirrored by XDG into /data
+#            (state→/data/state, share→/data/data, config→/data/cfg,
+#            cache→/data/cache, anything else→/mnt);
+#            "SRC:DST[:OPTS]" — mounted explicitly (e.g. ro)
+# Paths missing on disk → a warning, the run continues.
+
+[myproject]
+state = "oc"
+paths = ["~/src/myproject"]
+mount = [
+  "~/.local/state/myproject",
+  # "~/.local/share/tool/cache.db",
+]
