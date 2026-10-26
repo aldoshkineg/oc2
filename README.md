@@ -74,6 +74,7 @@ is passed to opencode):
 ./oc --mount ~/.config/newsboat/urls ... # mount without config
 ./oc --mount SRC:DST:ro ...              # explicit DST/options (ro)
 OC_DRY_RUN=1 ./oc ...                    # print the podman command, don't run
+                                         # (no state, no dirs; <auto> image)
 ```
 
 Auto-detection: `oc` compares cwd with `paths` of `profiles.toml` sections
@@ -130,8 +131,11 @@ packages and tool settings installed in a session survive restarts (the
 
 Everything about the container is baked at creation: the image, the profile
 mounts, `/data`, and `/workspace` = `paths[0]` of the project (the cwd at
-launch does not matter). Changing mounts in the profile later is detected and
-refused with a hint to recreate the container.
+launch does not matter). Any difference between the profile and the container
+is detected — a mount added, a mount revoked, a changed `paths[0]` — and
+refused with a hint to recreate the container keeping the state
+(`--drop-container`). A mount path missing at creation is skipped with a
+warning and is baked nowhere: create such paths before the first run.
 
 ```sh
 ./oc                                             # enters the container (or
@@ -146,7 +150,9 @@ refused with a hint to recreate the container.
 
 Both drop flags resolve the target the same way (cwd project, `--project`,
 `--state`) and refuse to run without one. `OC_DRY_RUN=1` prints the whole
-chain (`create → start → exec` or the removal commands) without running them.
+chain (`create → start → exec` or the removal commands) without running them:
+no state directory, no migration, and the image is only looked up when
+possible (otherwise `<auto>` is printed).
 
 ## Layout inside the state profile (~/.local/share/oc2/profiles/<state>/)
 

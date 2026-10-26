@@ -109,6 +109,15 @@ container mounts. All decisions are agreed:
       refused with a hint); `/workspace` = the project's paths[0]. Persistence
       belongs to the state: any project bound to it marks it persistent for
       every run into that state.
+- [x] hardening pass after the review: the drift hint suggests
+      `--drop-container` (never wiping the state), the mount check compares the
+      full set both ways and includes `/workspace`; dry-run is side-effect free
+      (no state dir, no migration) and works without podman (image `<auto>`);
+      missing-mount warnings are actionable; `--project-list` marks the default
+      state and counts missing `paths`; one state-name validator for both
+      `--state` and profiles; `podman_present` reports podman failures instead
+      of treating them as "no container". Tests: 50 (+drift hint, dry-run
+      purity, image placeholder, state-name rule, podman failure).
 - [ ] (optional) `make shell` should also pass the day-profiles — currently
       shell mounts only /data and /workspace directly via podman
 - [ ] (optional) a "pre-ingest" mode: a separate profile/flag so that the

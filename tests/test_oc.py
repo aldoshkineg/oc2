@@ -172,16 +172,19 @@ class PickImage(Base):
         self.assertIn(oc.IMAGE_REPO, run.call_args[0][0])
 
     def test_podman_failure_dies(self):
+        bad = subprocess.CompletedProcess([], 1, "", "no such image")
+        with mock.patch.object(oc.subprocess, "run", return_value=bad):
+            with self.assertRaises(SystemExit) as cm:
+                oc.pick_image("")
+        self.assertIn("podman images failed", str(cm.exception))
+
+    def test_podman_missing_dies(self):
         with mock.patch.object(
-            oc.subprocess,
-            "run",
-            side_effect=subprocess.CalledProcessError(
-                1, "podman", stderr="no such image"
-            ),
+            oc.subprocess, "run", side_effect=FileNotFoundError("podman")
         ):
             with self.assertRaises(SystemExit) as cm:
                 oc.pick_image("")
-        self.assertIn("oc:", str(cm.exception))
+        self.assertIn("podman not found", str(cm.exception))
 
 
 class ScanArgs(Base):
@@ -440,6 +443,10 @@ class E2E(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("daynews", r.stdout)
         self.assertIn("state=oc2", r.stdout)
+        # no project for the cwd → the default state is marked as such
+        self.assertIn("state: oc (default)", r.stdout)
+        r = self.oc_run(["--project-list"], cwd=self.home / "src/daynews")
+        self.assertIn("state: oc2 (project)", r.stdout)
 
     def test_unknown_project_error(self):
         self.set_profiles(DAYNEWS_TOML)
@@ -525,6 +532,68 @@ class E2E(Base):
         r = self.oc_run(["run"], env={"OC_IMAGE": "", "OC_DRY_RUN": "0"})
         self.assertEqual(r.returncode, 1)
         self.assertIn("podman not found", r.stderr)
+
+    def test_dry_run_has_no_side_effects(self):
+        # a preview prints commands: no state directory, no migration
+        proj = self.daynews_fixture()
+        self.set_profiles(DAYNEWS_TOML)
+        r = self.oc_run(["--project", "daynews"], cwd=proj)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("podman run --rm", r.stdout)
+        self.assertFalse((self.home / ".local/share/oc2").exists())
+
+    def test_dry_run_without_podman(self):
+        # the image cannot be resolved without podman → placeholder, not an error
+        proj = self.daynews_fixture()
+        self.set_profiles(DAYNEWS_TOML)
+        r = self.oc_run(
+            ["--project", "daynews"],
+            cwd=proj,
+            env={"OC_IMAGE": "", "PATH": "/nonexistent"},
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("localhost/opencode:<auto>", r.stdout)
+        self.assertIn("dry-run: podman not found", r.stderr)
+
+    def test_state_name_single_rule_cli(self):
+        self.set_profiles("[x]\n")
+        r = self.oc_run(["--state", "a b"])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("invalid state", r.stderr)
+
+    def test_state_name_single_rule_profiles(self):
+        self.set_profiles('[d]\nstate = "a/b"\n')
+        with self.assertRaises(SystemExit) as cm:
+            oc.collect_binds("d", [], self.tmp)
+        self.assertIn("invalid state", str(cm.exception))
+
+    def test_drift_hint_keeps_the_state(self):
+        # the container mounts must match the profile exactly; the advice is
+        # the least destructive one (--drop-container, not --drop)
+        proj = self.daynews_fixture()
+        self.set_profiles(PERSISTENT_TOML)
+        os.environ["OC_IMAGE"] = "x:1"
+        os.environ["OC_DRY_RUN"] = "0"
+        os.chdir(proj)
+        with (
+            mock.patch.object(oc, "podman_present", return_value=True),
+            mock.patch.object(oc, "container_binds", return_value={"x:/data"}),
+            mock.patch.object(oc.sys, "argv", ["oc", "--project", "daynews"]),
+            self.assertRaises(SystemExit) as cm,
+        ):
+            oc.main()
+        msg = str(cm.exception)
+        self.assertIn("not mounted:", msg)
+        self.assertIn("stale:", msg)
+        self.assertIn("--drop-container", msg)
+        self.assertNotIn(" --drop ", msg)
+
+    def test_podman_present_failure_is_an_error(self):
+        bad = subprocess.CompletedProcess([], 2, "", "cannot connect")
+        with mock.patch.object(oc.subprocess, "run", return_value=bad):
+            with self.assertRaises(SystemExit) as cm:
+                oc.podman_present(["podman", "ps"])
+        self.assertIn("podman failed", str(cm.exception))
 
 
 if __name__ == "__main__":

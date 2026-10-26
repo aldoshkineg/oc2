@@ -37,7 +37,7 @@ OC_PROFILES=/path). Section = project:
   paths      — project directories for cwd auto-detection (deepest match
                wins),
   mounts     — include other sections (recursively, cycles are caught),
-  mount      — paths; missing on disk → warning.
+  mount      — paths; missing on disk → skipped with a warning.
   persistent — true: the state profile becomes persistent: a named
                container keeps the layer between runs (binaries, pip/apt
                packages, tool settings survive); opencode is entered via
@@ -54,7 +54,9 @@ Environment variables:
   OC_IMAGE=repo:tag   override the image
   OC_DATA=/path       where the state lives (default ~/.local/share/oc2)
   OC_WORKSPACE=/path  what to mount as /workspace (default cwd)
-  OC_DRY_RUN=1        print the podman commands without running them
+  OC_DRY_RUN=1        print the podman commands without running them (nothing
+                      is created, no migration; the image is resolved when
+                      possible, otherwise shown as <auto>)
   OC_PROFILES=/path   a different profiles.toml (for tests)
 """
 
@@ -117,6 +119,17 @@ def mirror(src: Path) -> str:
 def die(msg):
     """Error: "oc: …" to stderr + SystemExit with the same message (code 1)."""
     raise SystemExit(f"oc: {msg}")
+
+
+def valid_state(st, source):
+    """Validate a state profile name: one spelling for both inputs.
+
+    The name becomes a directory (profiles/<state>) and a part of the
+    container name, so only letters, digits, "_" and "-" are allowed.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", st):
+        die(f"{source}: invalid state '{st}' (letters, digits, '_', '-' only)")
+    return st
 
 
 def parse_entry(spec, context):
@@ -231,11 +244,6 @@ def collect_binds(project_arg, mounts, cwd):
     warns = []
     state_hint = None
 
-    def valid_state(st, src):
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", st):
-            die(f"{path}: [{src}]: invalid state '{st}'")
-        return st
-
     def apply(name, stack=()):
         nonlocal state_hint
         if name in stack:
@@ -250,7 +258,7 @@ def collect_binds(project_arg, mounts, cwd):
         if not isinstance(pers, bool):
             die(f"{path}: [{name}]: persistent must be true/false")
         if "state" in body:
-            st = valid_state(str(body["state"]), name)
+            st = valid_state(str(body["state"]), f"{path}: [{name}]")
             if state_hint and state_hint != st:
                 die(
                     f"{path}: conflicting state in the involved projects "
@@ -267,7 +275,11 @@ def collect_binds(project_arg, mounts, cwd):
                 continue
             binds.append(b)
         if missing:
-            warns.append(f"project {name}: missing {', '.join(missing)} — skipping")
+            warns.append(
+                f"project {name}: missing {', '.join(missing)} — skipping "
+                f"(not mounted; create it if it must be shared — files the app "
+                f"creates itself can be ignored)"
+            )
 
     def detect():
         """Project from cwd: paths of the sections, the deepest match wins."""
@@ -347,8 +359,7 @@ def scan_args(argv):
                 state = argv[i]
             else:
                 state = tok[len("--state=") :]
-            if not state or Path(state).name != state or state.startswith("."):
-                die(f"--state: invalid name '{state}' (no '/', '..' or dots)")
+            valid_state(state, "--state")
         elif tok == "--project" or tok.startswith("--project="):
             if tok == "--project":
                 i += 1
@@ -386,30 +397,65 @@ def version_key(tag):
     return [int(p) for p in re.findall(r"\d+", tag)]
 
 
-def pick_image(image_env):
-    """OC_IMAGE wins; otherwise the freshest tag of the IMAGE_REPO image.
+def newest_image():
+    """Newest local tag of IMAGE_REPO, or None when there is no image.
 
     The repo name is mandatory: without it `podman images` returns the tags of
     ALL images and a foreign :3.22 (alpine etc.) becomes
     localhost/opencode:3.22.
     """
-    if image_env:
-        return image_env
     try:
-        out = subprocess.run(
+        r = subprocess.run(
             ["podman", "images", "--format", "{{.Tag}}", IMAGE_REPO],
             capture_output=True,
             text=True,
-            check=True,
-        ).stdout
+        )
     except FileNotFoundError:
         die("podman not found (and OC_IMAGE is not set)")
-    except subprocess.CalledProcessError as e:
-        die("podman images failed: " + (e.stderr or "").strip())
-    tags = [t for t in out.splitlines() if t and t != "<none>"]
+    if r.returncode != 0:
+        die("podman images failed: " + (r.stderr or "").strip())
+    tags = [t for t in r.stdout.splitlines() if t and t != "<none>"]
     if not tags:
-        die(f"no image {IMAGE_REPO} — build one: make build")
+        return None
     return f"{IMAGE_REPO}:{max(tags, key=version_key)}"
+
+
+def pick_image(image_env):
+    """OC_IMAGE wins; otherwise the freshest tag of the IMAGE_REPO image."""
+    if image_env:
+        return image_env
+    image = newest_image()
+    if image is None:
+        die(f"no image {IMAGE_REPO} — build one: make build")
+    return image
+
+
+def image_for_run():
+    """Image for this run; a dry-run preview must work without podman.
+
+    With OC_IMAGE unset the newest local tag is used. In dry-run an unresolved
+    image is not an error: a placeholder is printed instead of failing, so the
+    plan can be previewed anywhere (CI, a fresh machine).
+    """
+    image_env = os.environ.get("OC_IMAGE", "")
+    if image_env:
+        return image_env
+    if os.environ.get("OC_DRY_RUN") != "1":
+        return pick_image("")
+    placeholder = f"{IMAGE_REPO}:<auto>"
+    reason = f"no image {IMAGE_REPO}"
+    try:
+        image = newest_image()
+    except SystemExit as e:
+        image = None
+        reason = str(e).removeprefix("oc: ")
+    if image is None:
+        print(
+            f"oc: >> dry-run: {reason} — showing the placeholder {placeholder}",
+            file=sys.stderr,
+        )
+        return placeholder
+    return image
 
 
 def env_args():
@@ -439,8 +485,14 @@ def mount_args(data, workspace, binds):
 
 
 def podman_present(cmd, out=None):
-    """True if `podman ... cmd` returned a non-empty output (text or None)."""
+    """True if `podman …` printed a non-empty output (text or None).
+
+    A podman failure is a failure, not an absence: otherwise a broken podman
+    looks like "no container" and the user gets a confusing secondary error.
+    """
     r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        die("podman failed: " + (r.stderr or "").strip())
     if out is None:
         return bool(r.stdout.strip())
     return r.stdout.strip() == out
@@ -526,6 +578,7 @@ def main():
     project_arg, mounts, state_arg, drop, drop_container, list_projects, child = (
         scan_args(sys.argv[1:])
     )
+    dry = os.environ.get("OC_DRY_RUN") == "1"
     cwd = Path(os.environ.get("OC_WORKSPACE") or os.getcwd()).resolve()
     binds, warns, state_hint, chosen = collect_binds(project_arg, mounts, cwd)
 
@@ -544,19 +597,25 @@ def main():
         drop_state(state, data, wipe_state=not drop_container)
         return
 
-    data = state_dir(state, migrate=not list_projects)
+    # dry-run and --project-list are previews: no migration, no directories
+    data = state_dir(state, migrate=not (list_projects or dry))
 
     if list_projects:
         profiles, _ = load_profiles()
+        origin = "--state" if state_arg else ("project" if state_hint else "default")
+        print(f"state: {state} ({origin})")
         if profiles:
             print("profiles.toml projects:")
             for name in sorted(profiles):
                 body = profiles[name]
-                paths = ", ".join(body.get("paths", [])) or "—"
+                raw_paths = body.get("paths", [])
+                paths = ", ".join(raw_paths) or "—"
+                gone = [p for p in raw_paths if not Path(str(p)).expanduser().exists()]
+                where = f"  [{len(gone)} path(s) missing]" if gone else ""
                 mark = "  [persistent]" if body.get("persistent") else ""
                 print(
                     f"  {name}{mark}  state={body.get('state', '—')}  "
-                    f"mount={len(body.get('mount', []))}  paths=[{paths}]"
+                    f"mount={len(body.get('mount', []))}  paths=[{paths}]{where}"
                 )
         else:
             print("profiles.toml is empty — no project sections")
@@ -577,8 +636,7 @@ def main():
         return
 
     workspace = Path(os.environ.get("OC_WORKSPACE") or os.getcwd()).expanduser()
-    image = pick_image(os.environ.get("OC_IMAGE", ""))
-    os.makedirs(data, exist_ok=True)
+    image = image_for_run()
 
     profiles, _ = load_profiles()
     owners = [
@@ -612,9 +670,10 @@ def main():
         if sys.stdin.isatty():
             run_args.append("-it")
         run_args += mount_and_env + [image] + child
-        if os.environ.get("OC_DRY_RUN") == "1":
+        if dry:
             print(shlex.join(run_args))
             return
+        os.makedirs(data, exist_ok=True)
         os.execvp("podman", run_args)
 
     # persistent project: a named container keeps the layer between runs;
@@ -631,11 +690,12 @@ def main():
     tty = sys.stdin.isatty()
     exec_args = ["podman", "exec"] + (["-it"] if tty else [])
     exec_args += env_args() + [name] + (child or EXEC_ENTRYPOINT)
-    if os.environ.get("OC_DRY_RUN") == "1":
+    if dry:
         print(shlex.join(create_args + mount_and_env + [image]))
         print(shlex.join(["podman", "start", name]))
         print(shlex.join(exec_args))
         return
+    os.makedirs(data, exist_ok=True)
     if not podman_present(
         ["podman", "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"],
         name,
@@ -648,16 +708,26 @@ def main():
     ):
         run_podman(["podman", "start", name], f"podman start {name}")
     print(f"oc: >> entering the persistent container {name}", file=sys.stderr)
-    # the mounts are baked into the container at creation; make sure the
-    # profile did not change them since
+    # The mounts are baked into the container at creation: compare the whole
+    # set both ways (a mount both added and revoked must be reported), and the
+    # hint must be the least destructive one: keep the state.
     baked = container_binds(name)
-    wanted = {f"{data}:/data", *(f"{b.src}:{b.dst}" for b in binds)}
-    stale = wanted - baked
-    if stale:
+    wanted = {
+        f"{data}:/data",
+        f"{workspace}:/workspace",
+        *(f"{b.src}:{b.dst}" for b in binds),
+    }
+    if baked != wanted:
+        details = []
+        if wanted - baked:
+            details.append(f"not mounted: {', '.join(sorted(wanted - baked))}")
+        if baked - wanted:
+            details.append(f"stale: {', '.join(sorted(baked - wanted))}")
         die(
             f"the persistent container {name} has different mounts "
-            f"(baked at creation): {', '.join(sorted(stale))}; "
-            f"recreate it: ./oc --drop --project {owner}"
+            f"(baked at creation): {'; '.join(details)}; "
+            f"recreate it, keeping the state: "
+            f"./oc --drop-container --project {owner}"
         )
     os.execvp("podman", exec_args)
 

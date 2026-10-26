@@ -15,7 +15,9 @@
 #             tool settings installed in a session survive restarts; drop
 #             it with `./oc --drop` (or `--drop-container` to keep the
 #             state)
-# Paths missing on disk → a warning, the run continues.
+# Paths missing on disk → skipped with a warning, the run continues (create
+# them before the first run of a persistent project: they are baked at
+# container creation).
 
 [myproject]
 state = "oc"
